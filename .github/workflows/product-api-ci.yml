@@ -1,0 +1,160 @@
+name: Product API CI
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'services/product-api/**'
+      - '.github/workflows/product-api-ci.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'services/product-api/**'
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/nexuscloud-product-api
+
+jobs:
+  build-and-test:
+    name: Build, Test & Push
+    runs-on: ubuntu-latest
+
+    # Spin up a real PostgreSQL for integration tests
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: nexuscloud
+          POSTGRES_PASSWORD: nexuscloud_password
+          POSTGRES_DB: nexuscloud_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: services/product-api/go.sum
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Verify Go code compiles
+        working-directory: services/product-api
+        run: go build ./...
+
+      - name: Run Go vet (static analysis)
+        working-directory: services/product-api
+        run: go vet ./...
+
+      - name: Build Docker image for testing
+        run: |
+          docker build \
+            -t nexuscloud/product-api:test \
+            ./services/product-api
+
+      - name: Run container and verify health
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: nexuscloud
+          DB_PASSWORD: nexuscloud_password
+          DB_NAME: nexuscloud_db
+        run: |
+          docker run -d \
+            --name product-api-test \
+            --network host \
+            -e DB_HOST=localhost \
+            -e DB_PORT=5432 \
+            -e DB_USER=nexuscloud \
+            -e DB_PASSWORD=nexuscloud_password \
+            -e DB_NAME=nexuscloud_db \
+            -e PORT=8080 \
+            -e GIN_MODE=release \
+            nexuscloud/product-api:test
+
+          echo "Waiting for service to start..."
+          sleep 5
+
+          # Health check
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Health check FAILED — HTTP $RESPONSE"
+            docker logs product-api-test
+            exit 1
+          fi
+          echo "Health check PASSED — HTTP $RESPONSE"
+
+          # Create a product
+          CREATE_RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/products \
+            -H "Content-Type: application/json" \
+            -d '{"name":"CI Test Product","description":"Created by CI","price":9.99,"stock":10}')
+          echo "Create response: $CREATE_RESPONSE"
+
+          PRODUCT_ID=$(echo $CREATE_RESPONSE | grep -o '"id":[0-9]*' | cut -d':' -f2)
+          if [ -z "$PRODUCT_ID" ]; then
+            echo "Create product FAILED — no ID returned"
+            docker logs product-api-test
+            exit 1
+          fi
+          echo "Create product PASSED — ID: $PRODUCT_ID"
+
+          # Get all products
+          GET_RESPONSE=$(curl -s http://localhost:8080/api/v1/products)
+          echo "Get all response: $GET_RESPONSE"
+          echo "Get products PASSED"
+
+          # Get single product
+          SINGLE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/v1/products/$PRODUCT_ID)
+          if [ "$SINGLE" != "200" ]; then
+            echo "Get single product FAILED — HTTP $SINGLE"
+            exit 1
+          fi
+          echo "Get single product PASSED"
+
+          # Delete the product
+          DELETE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X DELETE http://localhost:8080/api/v1/products/$PRODUCT_ID)
+          if [ "$DELETE" != "200" ]; then
+            echo "Delete product FAILED — HTTP $DELETE"
+            exit 1
+          fi
+          echo "Delete product PASSED"
+
+          echo "All tests PASSED ✓"
+
+      - name: Build and push to Docker Hub
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/product-api
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print image digest
+        run: echo "Image pushed — ${{ steps.meta.outputs.tags }}"
